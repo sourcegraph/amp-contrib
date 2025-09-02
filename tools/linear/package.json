@@ -1,0 +1,19 @@
+{
+  "name": "linear",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "mkdir -p .agents/tools && bun build --compile ./linear_get_issue.js --outfile .agents/tools/linear_get_issue && bun build --compile ./linear_add_bugfix_comment.js --outfile .agents/tools/linear_add_bugfix_comment && chmod +x .agents/tools/linear_get_issue .agents/tools/linear_add_bugfix_comment",
+    "clean": "rm -f .agents/tools/linear_get_issue .agents/tools/linear_add_bugfix_comment"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@linear/sdk": "^58.1.0"
+  }
+}
