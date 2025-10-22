@@ -8,8 +8,8 @@ async function main() {
   if (action === 'describe') {
     const schema = {
       name: 'deepsearch__add_question',
-      description: 'Add a question to an existing Deep Search conversation. Optionally request async processing.',
-      parameters: {
+      description: 'Add a question to an existing Deep Search conversation. Optionally request async processing.\n\nIMPORTANT: Deep Search queries typically take 1-2 minutes to process. Always use prefer_async:true (the default) to avoid timeout errors. When using async mode, poll for results using the list_conv tool with filter_id.',
+      inputSchema: {
         type: 'object',
         properties: {
           id: { type: 'number', description: 'Conversation ID' },
@@ -27,28 +27,41 @@ async function main() {
     const input = await readStdinJson();
     const id = getParam(input, 'id', true, 'number');
     const question = getParam(input, 'question', true, 'string');
-    const preferAsync = getParam(input, 'prefer_async', false, 'boolean') || false;
+    const preferAsync = getParam(input, 'prefer_async', false, 'boolean');
+    // Default to true if not specified (async is recommended to avoid timeouts)
+    const useAsync = preferAsync !== undefined ? preferAsync : true;
 
     const { baseUrl, token, xrw, timeout } = getConfig();
     const url = new URL(`/\.api/deepsearch/v1/${encodeURIComponent(String(id))}/questions`.replace('%2F','/'), baseUrl);
     const headers = baseHeaders(token, xrw);
-    if (preferAsync) headers['Prefer'] = 'respond-async';
+    if (useAsync) headers['Prefer'] = 'respond-async';
     headers['Content-Type'] = 'application/json';
 
     // API examples show conversation_id in body; include it alongside path ID for consistency
     const body = JSON.stringify({ conversation_id: id, question });
-    const json = await doRequest('POST', url, headers, body, timeout);
-    // Extract only essential fields from the verbose response
-    const simplified = {
-      id: json.id,
-      conversation_id: json.conversation_id,
-      question: json.question,
-      title: json.title,
-      answer: json.answer,
-      sources: json.sources,
-      status: json.status
-    };
-    print(simplified);
+    try {
+      const json = await doRequest('POST', url, headers, body, timeout);
+      // Extract only essential fields from the verbose response
+      const simplified = {
+        id: json.id,
+        conversation_id: json.conversation_id,
+        question: json.question,
+        title: json.title,
+        answer: json.answer,
+        sources: json.sources,
+        status: json.status
+      };
+      print(simplified);
+    } catch (reqErr) {
+      // Provide helpful message for timeout errors
+      if (reqErr.message && reqErr.message.includes('timeout')) {
+        const helpMsg = useAsync 
+          ? 'Request timed out. This is unexpected with async mode. Check your connection or try increasing HTTP_TIMEOUT.'
+          : 'Request timed out. Deep Search queries take 1-2 minutes. Try using prefer_async:true to avoid timeouts.';
+        errorExit(`${reqErr.message}\n\n${helpMsg}`);
+      }
+      throw reqErr;
+    }
   } catch (err) {
     errorExit(err.message || String(err));
   }
@@ -59,7 +72,8 @@ function getConfig() {
   const token = process.env.SRC_ACCESS_TOKEN;
   if (!token) throw new Error('SRC_ACCESS_TOKEN environment variable is required');
   const xrw = process.env.X_REQUESTED_WITH || 'amp-toolbox 0.1.0';
-  const timeout = parseInt(process.env.HTTP_TIMEOUT || '30', 10);
+  // Async requests need less timeout (just getting 202), sync needs more (up to 60s before Cloudflare timeout)
+  const timeout = parseInt(process.env.HTTP_TIMEOUT || '70', 10);
   return { baseUrl, token, xrw, timeout };
 }
 

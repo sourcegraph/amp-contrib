@@ -1,21 +1,23 @@
 #!/usr/bin/env node
 const http = require('http');
 const https = require('https');
-const { URL, URLSearchParams } = require('url');
+const { URL } = require('url');
 
 async function main() {
   const action = process.env.TOOLBOX_ACTION || 'execute';
   if (action === 'describe') {
     const schema = {
-      name: 'deepsearch__create_conv',
-      description: 'Create a new Deep Search conversation by asking a question. Use this tool when users need to investigate code across their entire enterprise\'s remote repositories - it\'s perfect for questions like "how is authentication implemented across all our microservices" when those services span multiple repos the user hasn\'t cloned locally. Provide natural language queries and let it autonomously search across all accessible repositories using its parallel tool execution to build comprehensive cross-repo understanding. Leverage it for enterprise-scale code discovery where manual repository exploration would be impractical, but remember it can\'t do exhaustive searches.\n\nIMPORTANT: Deep Search queries typically take 1-2 minutes to process. Always use prefer_async:true (the default) to avoid timeout errors. When using async mode, poll for results using the list_conv tool with filter_id.',
+      name: 'deepsearch__poll_question',
+      description: 'Poll a Deep Search question until it completes or times out. This tool implements the recommended polling strategy: checks every 10 seconds for up to 300 seconds (5 minutes). Use this after creating an async conversation to wait for results.',
       inputSchema: {
         type: 'object',
         properties: {
-          question: { type: 'string', description: 'Your question to ask.' },
-          prefer_async: { type: 'boolean', description: 'If true, send Prefer: respond-async and return 202 + processing status.' },
+          conversation_id: { type: 'number', description: 'Conversation ID' },
+          question_id: { type: 'number', description: 'Question ID' },
+          poll_interval: { type: 'number', description: 'Polling interval in seconds (default: 10)' },
+          max_wait: { type: 'number', description: 'Maximum wait time in seconds (default: 300)' },
         },
-        required: ['question'],
+        required: ['conversation_id', 'question_id'],
       },
     };
     process.stdout.write(JSON.stringify(schema, null, 2) + '\n');
@@ -24,47 +26,74 @@ async function main() {
 
   try {
     const input = await readStdinJson();
-    const question = getParam(input, 'question', true, 'string');
-    const preferAsync = getParam(input, 'prefer_async', false, 'boolean');
-    // Default to true if not specified (async is recommended to avoid timeouts)
-    const useAsync = preferAsync !== undefined ? preferAsync : true;
+    const conversationId = getParam(input, 'conversation_id', true, 'number');
+    const questionId = getParam(input, 'question_id', true, 'number');
+    const pollInterval = getParam(input, 'poll_interval', false, 'number') || 10;
+    const maxWait = getParam(input, 'max_wait', false, 'number') || 300;
 
     const { baseUrl, token, xrw, timeout } = getConfig();
-
-    const url = new URL('/.api/deepsearch/v1', baseUrl);
+    const url = new URL(`/.api/deepsearch/v1/${conversationId}`, baseUrl);
     const headers = baseHeaders(token, xrw);
-    if (useAsync) headers['Prefer'] = 'respond-async';
-    headers['Content-Type'] = 'application/json';
 
-    const body = JSON.stringify({ question });
-    try {
-      const json = await doRequest('POST', url, headers, body, timeout);
-      // Extract only essential fields from the verbose response
-      const simplified = {
-        id: json.id,
-        questions: json.questions?.map(q => ({
-          id: q.id,
-          question: q.question,
-          title: q.title,
-          answer: q.answer,
-          sources: q.sources,
-          status: q.status
-        })) || []
-      };
-      print(simplified);
-    } catch (reqErr) {
-      // Provide helpful message for timeout errors
-      if (reqErr.message && reqErr.message.includes('timeout')) {
-        const helpMsg = useAsync 
-          ? 'Request timed out. This is unexpected with async mode. Check your connection or try increasing HTTP_TIMEOUT.'
-          : 'Request timed out. Deep Search queries take 1-2 minutes. Try using prefer_async:true to avoid timeouts.';
-        errorExit(`${reqErr.message}\n\n${helpMsg}`);
+    const maxAttempts = Math.ceil(maxWait / pollInterval);
+    let attempt = 0;
+
+    while (attempt < maxAttempts) {
+      attempt++;
+      
+      try {
+        const convJson = await doRequest('GET', url, headers, null, timeout);
+        // Find the specific question in the conversation
+        const json = convJson.questions?.find(q => q.id === questionId);
+        if (!json) {
+          errorExit(`Question ${questionId} not found in conversation ${conversationId}`);
+        }
+        const status = json.status;
+
+        // Show progress - use console.log to ensure it flushes immediately
+        const elapsed = attempt * pollInterval;
+        console.log(`⏳ Polling attempt ${attempt}/${maxAttempts} (${elapsed}s elapsed) - status: ${status}`);
+
+        if (status === 'completed') {
+          // Return the completed question
+          const simplified = {
+            id: json.id,
+            conversation_id: json.conversation_id,
+            question: json.question,
+            title: json.title,
+            answer: json.answer,
+            sources: json.sources,
+            status: json.status,
+            polling_info: {
+              attempts: attempt,
+              elapsed_seconds: elapsed
+            }
+          };
+          console.log('\n✅ Question completed!\n');
+          print(simplified);
+          return;
+        } else if (status === 'failed') {
+          errorExit(`Question failed: ${json.failure_message || 'Unknown error'}`);
+        }
+
+        // Still processing
+        if (attempt < maxAttempts) {
+          await sleep(pollInterval * 1000);
+        }
+      } catch (reqErr) {
+        errorExit(`Error polling question: ${reqErr.message}`);
       }
-      throw reqErr;
     }
+
+    // Timed out
+    errorExit(`Timeout: Question did not complete within ${maxWait} seconds (${maxAttempts} attempts)`);
   } catch (err) {
     errorExit(err.message || String(err));
   }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function getConfig() {
@@ -72,8 +101,7 @@ function getConfig() {
   const token = process.env.SRC_ACCESS_TOKEN;
   if (!token) throw new Error('SRC_ACCESS_TOKEN environment variable is required');
   const xrw = process.env.X_REQUESTED_WITH || 'amp-toolbox 0.1.0';
-  // Async requests need less timeout (just getting 202), sync needs more (up to 60s before Cloudflare timeout)
-  const timeout = parseInt(process.env.HTTP_TIMEOUT || '70', 10);
+  const timeout = parseInt(process.env.HTTP_TIMEOUT || '30', 10);
   return { baseUrl, token, xrw, timeout };
 }
 
@@ -100,13 +128,11 @@ function readStdinJson() {
 
 function getParam(obj, name, required, type) {
   const v = obj[name];
-  if (required && (v === undefined || v === null || v === '')) {
-    throw new Error(`'${name}' required`);
-  }
+  if (required && (v === undefined || v === null || v === '')) throw new Error(`'${name}' required`);
   if (v !== undefined && v !== null) {
+    if (type === 'number' && typeof v !== 'number') throw new Error(`'${name}' must be number`);
     if (type === 'string' && typeof v !== 'string') throw new Error(`'${name}' must be string`);
     if (type === 'boolean' && typeof v !== 'boolean') throw new Error(`'${name}' must be boolean`);
-    if (type === 'number' && typeof v !== 'number') throw new Error(`'${name}' must be number`);
   }
   return v;
 }

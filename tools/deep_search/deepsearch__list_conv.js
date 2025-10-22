@@ -9,7 +9,7 @@ async function main() {
     const schema = {
       name: 'deepsearch__list_conv',
       description: 'List Deep Search conversations with optional filters and pagination.',
-      parameters: {
+      inputSchema: {
         type: 'object',
         properties: {
           filter_id: { type: 'string', description: 'Filter by conversation ID' },
