@@ -1,9 +1,5 @@
 # Deep Search API Usage
 
-Owner: James McNamara
-Last edited time: August 22, 2025 2:04 PM
-Status: Not started
-
 The Deep Search API allows you to create AI-powered conversations that can search and analyze your codebase. This API is available at version 6.7+ and provides endpoints for managing conversations and questions.
 
 ## Authentication

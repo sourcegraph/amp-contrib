@@ -8,7 +8,7 @@ async function main() {
   if (action === 'describe') {
     const schema = {
       name: 'deepsearch__create_conv',
-      description: 'Create a new Deep Search conversation by asking a question. Use this tool when users need to investigate code across their entire enterprise\'s remote repositories - it\'s perfect for questions like "how is authentication implemented across all our microservices" when those services span multiple repos the user hasn\'t cloned locally. Provide natural language queries and let it autonomously search across all accessible repositories using its parallel tool execution to build comprehensive cross-repo understanding. Leverage it for enterprise-scale code discovery where manual repository exploration would be impractical, but remember it can\'t do exhaustive searches.\n\nIMPORTANT: Deep Search queries typically take 1-2 minutes to process. Always use prefer_async:true (the default) to avoid timeout errors. When using async mode, poll for results using the list_conv tool with filter_id.',
+      description: 'Create a new Deep Search conversation by asking a question. Use this tool when users need to investigate code across their entire enterprise\'s remote repositories - it\'s perfect for questions like "how is authentication implemented across all our microservices" when those services span multiple repos the user hasn\'t cloned locally. Provide natural language queries and let it autonomously search across all accessible repositories using its parallel tool execution to build comprehensive cross-repo understanding. Leverage it for enterprise-scale code discovery where manual repository exploration would be impractical, but remember it can\'t do exhaustive searches.\n\nIMPORTANT: Deep Search queries typically take 1-2 minutes to process. By default (prefer_async:true), this tool will automatically poll for results every 10 seconds for up to 5 minutes, returning the completed answer when ready.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -39,19 +39,29 @@ async function main() {
     const body = JSON.stringify({ question });
     try {
       const json = await doRequest('POST', url, headers, body, timeout);
-      // Extract only essential fields from the verbose response
-      const simplified = {
-        id: json.id,
-        questions: json.questions?.map(q => ({
-          id: q.id,
-          question: q.question,
-          title: q.title,
-          answer: q.answer,
-          sources: q.sources,
-          status: q.status
-        })) || []
-      };
-      print(simplified);
+      
+      // If async and status is processing, auto-poll
+      if (useAsync && json.questions?.[0]?.status === 'processing') {
+        const convId = json.id;
+        const questionId = json.questions[0].id;
+        console.log(`🔄 Question created (ID: ${questionId}). Starting automatic polling...\n`);
+        const result = await pollUntilComplete(convId, questionId, baseUrl, token, xrw, timeout);
+        print(result);
+      } else {
+        // Extract only essential fields from the verbose response
+        const simplified = {
+          id: json.id,
+          questions: json.questions?.map(q => ({
+            id: q.id,
+            question: q.question,
+            title: q.title,
+            answer: q.answer,
+            sources: q.sources,
+            status: q.status
+          })) || []
+        };
+        print(simplified);
+      }
     } catch (reqErr) {
       // Provide helpful message for timeout errors
       if (reqErr.message && reqErr.message.includes('timeout')) {
@@ -109,6 +119,63 @@ function getParam(obj, name, required, type) {
     if (type === 'number' && typeof v !== 'number') throw new Error(`'${name}' must be number`);
   }
   return v;
+}
+
+async function pollUntilComplete(conversationId, questionId, baseUrl, token, xrw, timeout) {
+  const pollInterval = 10; // seconds
+  const maxWait = 300; // seconds (5 minutes)
+  const maxAttempts = Math.ceil(maxWait / pollInterval);
+  let attempt = 0;
+
+  const url = new URL(`/.api/deepsearch/v1/${conversationId}`, baseUrl);
+  const headers = baseHeaders(token, xrw);
+
+  while (attempt < maxAttempts) {
+    attempt++;
+    
+    try {
+      const convJson = await doRequest('GET', url, headers, null, timeout);
+      const json = convJson.questions?.find(q => q.id === questionId);
+      if (!json) {
+        throw new Error(`Question ${questionId} not found in conversation ${conversationId}`);
+      }
+      const status = json.status;
+
+      const elapsed = attempt * pollInterval;
+      console.log(`⏳ Polling attempt ${attempt}/${maxAttempts} (${elapsed}s elapsed) - status: ${status}`);
+
+      if (status === 'completed') {
+        console.log('\n✅ Question completed!\n');
+        return {
+          id: json.id,
+          conversation_id: json.conversation_id,
+          question: json.question,
+          title: json.title,
+          answer: json.answer,
+          sources: json.sources,
+          status: json.status,
+          polling_info: {
+            attempts: attempt,
+            elapsed_seconds: elapsed
+          }
+        };
+      } else if (status === 'failed') {
+        throw new Error(`Question failed: ${json.failure_message || 'Unknown error'}`);
+      }
+
+      if (attempt < maxAttempts) {
+        await sleep(pollInterval * 1000);
+      }
+    } catch (reqErr) {
+      throw new Error(`Error polling question: ${reqErr.message}`);
+    }
+  }
+
+  throw new Error(`Timeout: Question did not complete within ${maxWait} seconds (${maxAttempts} attempts)`);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function doRequest(method, urlObj, headers, body, timeoutSec) {
