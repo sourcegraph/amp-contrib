@@ -1,0 +1,181 @@
+#!/usr/bin/env node
+/**
+ * Toolbox Tool: detect-style-usage
+ * 
+ * Detects styling patterns (className, CSS imports, inline styles) that need
+ * transformation to React Native StyleSheet.
+ */
+
+const action = process.env.TOOLBOX_ACTION;
+
+if (action === 'describe') {
+	showDescription();
+} else if (action === 'execute') {
+	execute();
+}
+
+function showDescription() {
+	const spec = {
+		name: 'detect_style_usage',
+		description: 'Detect styling patterns (className, CSS/SCSS imports, inline styles, style objects) that need transformation to React Native StyleSheet API.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				filePath: {
+					type: 'string',
+					description: 'Absolute path to the TypeScript/JavaScript/JSX/TSX file to analyze',
+				},
+			},
+			required: ['filePath'],
+		},
+		meta: {
+			subagentTypes: ['all'],
+		},
+	};
+	process.stdout.write(JSON.stringify(spec));
+}
+
+async function execute() {
+	try {
+		const { Project, SyntaxKind } = await import('ts-morph');
+		const fs = await import('fs');
+		
+		const input = JSON.parse(fs.readFileSync(0, 'utf-8'));
+		const filePath = input.filePath;
+
+		if (!fs.existsSync(filePath)) {
+			console.error(JSON.stringify({ error: `File not found: ${filePath}` }));
+			process.exit(1);
+		}
+
+		const fileContent = fs.readFileSync(filePath, 'utf-8');
+		
+		const project = new Project({
+			useInMemoryFileSystem: true,
+			compilerOptions: {
+				jsx: 'react',
+				allowJs: true,
+			},
+		});
+
+		const sourceFile = project.createSourceFile('temp.tsx', fileContent);
+		
+		const patterns = {
+			cssImports: [],
+			classNameUsage: [],
+			inlineStyles: [],
+			styleObjects: [],
+		};
+
+		// Detect CSS/SCSS imports
+		const imports = sourceFile.getImportDeclarations();
+		for (const imp of imports) {
+			const moduleSpecifier = imp.getModuleSpecifierValue();
+			if (moduleSpecifier.match(/\.(css|scss|sass|less)$/)) {
+				patterns.cssImports.push({
+					import: imp.getText(),
+					line: imp.getStartLineNumber(),
+					file: moduleSpecifier,
+					suggestedAction: 'Remove CSS import. Convert styles to StyleSheet.create() in JavaScript.',
+				});
+			}
+		}
+
+		// Detect className usage in JSX
+		const jsxElements = sourceFile.getDescendantsOfKind(SyntaxKind.JsxOpeningElement);
+		const jsxSelfClosing = sourceFile.getDescendantsOfKind(SyntaxKind.JsxSelfClosingElement);
+		
+		for (const element of [...jsxElements, ...jsxSelfClosing]) {
+			const classNameAttr = element.getAttribute('className');
+			if (classNameAttr) {
+				const value = classNameAttr.getInitializer()?.getText() || '';
+				patterns.classNameUsage.push({
+					element: element.getTagNameNode().getText(),
+					className: value,
+					line: classNameAttr.getStartLineNumber(),
+					suggestedReplacement: 'style={styles.containerName}',
+				});
+			}
+
+			// Detect inline style objects
+			const styleAttr = element.getAttribute('style');
+			if (styleAttr) {
+				const initializer = styleAttr.getInitializer();
+				if (initializer) {
+					const styleText = initializer.getText();
+					// Check if it's an object literal (not just a reference)
+					if (styleText.includes('{') && styleText.includes('}')) {
+						patterns.inlineStyles.push({
+							element: element.getTagNameNode().getText(),
+							style: styleText,
+							line: styleAttr.getStartLineNumber(),
+							suggestedAction: 'Extract to StyleSheet.create() and check for unsupported CSS properties',
+						});
+					}
+				}
+			}
+		}
+
+		// Detect style object literals in variable declarations
+		const variableDeclarations = sourceFile.getVariableDeclarations();
+		for (const varDecl of variableDeclarations) {
+			const name = varDecl.getName();
+			if (name.toLowerCase().includes('style')) {
+				const initializer = varDecl.getInitializer();
+				if (initializer && initializer.getKind() === SyntaxKind.ObjectLiteralExpression) {
+					const text = initializer.getText();
+					// Check for CSS properties (kebab-case)
+					if (text.match(/['"][\w-]+['"]\s*:/)) {
+						patterns.styleObjects.push({
+							variable: name,
+							line: varDecl.getStartLineNumber(),
+							preview: text.length > 100 ? text.substring(0, 100) + '...' : text,
+							suggestedAction: 'Convert to StyleSheet.create() and transform kebab-case to camelCase',
+						});
+					}
+				}
+			}
+		}
+
+		const totalIssues = 
+			patterns.cssImports.length +
+			patterns.classNameUsage.length +
+			patterns.inlineStyles.length +
+			patterns.styleObjects.length;
+
+		const result = {
+			filePath,
+			totalStyleIssues: totalIssues,
+			patterns,
+			migrationGuides: ['react-native-style-migration.md'],
+			criticalTransformations: getCriticalTransformations(patterns),
+		};
+
+		console.log(JSON.stringify(result, null, 2));
+	} catch (error) {
+		console.error(JSON.stringify({ 
+			error: error.message,
+			stack: error.stack 
+		}));
+		process.exit(1);
+	}
+}
+
+function getCriticalTransformations(patterns) {
+	const transformations = [];
+	
+	if (patterns.cssImports.length > 0) {
+		transformations.push('Remove all CSS imports and convert to StyleSheet.create()');
+	}
+	
+	if (patterns.classNameUsage.length > 0) {
+		transformations.push('Replace all className props with style props');
+	}
+	
+	if (patterns.inlineStyles.length > 0 || patterns.styleObjects.length > 0) {
+		transformations.push('Convert CSS property names from kebab-case to camelCase');
+		transformations.push('Check for unsupported properties (grid, float, box-shadow, etc.)');
+	}
+	
+	return transformations;
+}

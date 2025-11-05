@@ -1,0 +1,196 @@
+#!/usr/bin/env node
+/**
+ * Toolbox Tool: check-ts-syntax
+ * 
+ * Incrementally compile/parse a TypeScript file to check for syntax errors.
+ * Works on individual files even when the tsconfig is not fully type-safe.
+ */
+
+const action = process.env.TOOLBOX_ACTION;
+
+if (action === 'describe') {
+	showDescription();
+} else if (action === 'execute') {
+	execute();
+}
+
+function showDescription() {
+	const spec = {
+		name: 'check_ts_syntax',
+		description: 'Incrementally compile/parse a TypeScript file to check for syntax errors. Works on individual files even when the tsconfig is not fully compliant. Returns syntax errors, parse errors, and basic type errors.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				filePath: {
+					type: 'string',
+					description: 'Absolute path to the TypeScript/JavaScript file to check',
+				},
+				strict: {
+					type: 'boolean',
+					description: 'Enable strict type checking (default: false - only checks syntax)',
+				},
+			},
+			required: ['filePath'],
+		},
+		meta: {
+			subagentTypes: ['scope'],
+		},
+	};
+	process.stdout.write(JSON.stringify(spec));
+}
+
+async function execute() {
+	try {
+		const tsModule = await import('typescript');
+		const ts = tsModule.default || tsModule;
+		const fs = await import('fs');
+		
+		const input = JSON.parse(fs.readFileSync(0, 'utf-8'));
+		const filePath = input.filePath;
+		const strictMode = input.strict || false;
+
+		if (!fs.existsSync(filePath)) {
+			console.error(JSON.stringify({ error: `File not found: ${filePath}` }));
+			process.exit(1);
+		}
+
+		const fileContent = fs.readFileSync(filePath, 'utf-8');
+		
+		const ext = filePath.endsWith('.tsx') || filePath.endsWith('.jsx') ? 
+		           ts.ScriptKind.TSX : ts.ScriptKind.TS;
+		
+		const sourceFile = ts.createSourceFile(
+			filePath,
+			fileContent,
+			ts.ScriptTarget.Latest,
+			true,
+			ext
+		);
+		
+		const syntaxErrors = [];
+		const parseErrors = [];
+		const semanticErrors = [];
+		
+		function processDiagnostic(diagnostic) {
+			const message = diagnostic.messageText;
+			const messageText = typeof message === 'string' ? message : message.messageText;
+			const category = diagnostic.category;
+			const categoryName = category === 0 ? 'warning' : 
+			                     category === 1 ? 'error' : 
+			                     category === 2 ? 'suggestion' : 'message';
+			
+			const start = diagnostic.start;
+			const length = diagnostic.length;
+			
+			let line = 'unknown';
+			let column = 'unknown';
+			let excerpt = '';
+			
+			if (start !== undefined && sourceFile) {
+				const { line: l, character: c } = sourceFile.getLineAndCharacterOfPosition(start);
+				line = l + 1;
+				column = c + 1;
+				
+				if (length !== undefined) {
+					excerpt = fileContent.substring(start, start + Math.min(length, 100));
+					if (length > 100) excerpt += '...';
+				}
+			}
+			
+			return {
+				message: messageText,
+				category: categoryName,
+				line,
+				column,
+				code: diagnostic.code,
+				excerpt: excerpt || undefined,
+			};
+		}
+		
+		const compilerOptions = {
+			allowJs: true,
+			checkJs: false,
+			noEmit: true,
+			jsx: ts.JsxEmit.React,
+			target: ts.ScriptTarget.Latest,
+			module: ts.ModuleKind.ESNext,
+		};
+		
+		const host = ts.createCompilerHost(compilerOptions);
+		const program = ts.createProgram([filePath], compilerOptions, {
+			...host,
+			getSourceFile: (fileName) => {
+				if (fileName === filePath) return sourceFile;
+				return host.getSourceFile(fileName, ts.ScriptTarget.Latest);
+			},
+		});
+		
+		const syntacticDiagnostics = program.getSyntacticDiagnostics(sourceFile);
+		
+		for (const diagnostic of syntacticDiagnostics) {
+			const errorObj = processDiagnostic(diagnostic);
+			syntaxErrors.push(errorObj);
+		}
+		
+		if (strictMode) {
+			const strictOptions = {
+				allowJs: true,
+				checkJs: true,
+				noEmit: true,
+				strict: true,
+				noImplicitAny: true,
+				strictNullChecks: true,
+				jsx: ts.JsxEmit.React,
+				target: ts.ScriptTarget.ESNext,
+				module: ts.ModuleKind.ESNext,
+			};
+			
+			const strictHost = ts.createCompilerHost(strictOptions);
+			const strictProgram = ts.createProgram([filePath], strictOptions, {
+				...strictHost,
+				getSourceFile: (fileName) => {
+					if (fileName === filePath) return sourceFile;
+					return strictHost.getSourceFile(fileName, ts.ScriptTarget.Latest);
+				},
+			});
+			
+			const semanticDiags = strictProgram.getSemanticDiagnostics(sourceFile);
+			
+			for (const diagnostic of semanticDiags) {
+				const errorObj = processDiagnostic(diagnostic);
+				if (diagnostic.code >= 1000 && diagnostic.code < 2000) {
+					parseErrors.push(errorObj);
+				} else {
+					semanticErrors.push(errorObj);
+				}
+			}
+		}
+		
+		const allErrors = [...syntaxErrors, ...parseErrors, ...semanticErrors];
+		const hasErrors = allErrors.some(e => e.category === 'error');
+		
+		const result = {
+			filePath,
+			valid: !hasErrors,
+			strictMode,
+			summary: {
+				totalErrors: allErrors.filter(e => e.category === 'error').length,
+				totalWarnings: allErrors.filter(e => e.category === 'warning').length,
+				syntaxErrors: syntaxErrors.length,
+				parseErrors: parseErrors.length,
+				semanticErrors: semanticErrors.length,
+			},
+			syntaxErrors,
+			parseErrors,
+			semanticErrors,
+		};
+
+		console.log(JSON.stringify(result, null, 2));
+	} catch (error) {
+		console.error(JSON.stringify({ 
+			error: error.message,
+			stack: error.stack 
+		}));
+		process.exit(1);
+	}
+}

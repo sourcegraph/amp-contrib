@@ -1,0 +1,206 @@
+#!/usr/bin/env node
+/**
+ * Toolbox Tool: detect-imports
+ * 
+ * Analyzes imports and suggests React Native package equivalents.
+ */
+
+const action = process.env.TOOLBOX_ACTION;
+
+if (action === 'describe') {
+	showDescription();
+} else if (action === 'execute') {
+	execute();
+}
+
+function showDescription() {
+	const spec = {
+		name: 'detect_imports',
+		description: 'Analyze import statements and identify web-specific packages that need React Native equivalents. Suggests alternative packages and migration paths.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				filePath: {
+					type: 'string',
+					description: 'Absolute path to the TypeScript/JavaScript file to analyze',
+				},
+			},
+			required: ['filePath'],
+		},
+	};
+	process.stdout.write(JSON.stringify(spec));
+}
+
+async function execute() {
+	try {
+		const { Project } = await import('ts-morph');
+		const fs = await import('fs');
+		
+		const input = JSON.parse(fs.readFileSync(0, 'utf-8'));
+		const filePath = input.filePath;
+
+		if (!fs.existsSync(filePath)) {
+			console.error(JSON.stringify({ error: `File not found: ${filePath}` }));
+			process.exit(1);
+		}
+
+		const fileContent = fs.readFileSync(filePath, 'utf-8');
+		
+		const project = new Project({
+			useInMemoryFileSystem: true,
+			compilerOptions: {
+				allowJs: true,
+			},
+		});
+
+		const sourceFile = project.createSourceFile('temp.ts', fileContent);
+		
+		const imports = {
+			needsReplacement: [],
+			reactNativeReady: [],
+			needsReview: [],
+		};
+
+		const importDeclarations = sourceFile.getImportDeclarations();
+		
+		for (const imp of importDeclarations) {
+			const moduleSpecifier = imp.getModuleSpecifierValue();
+			const namedImports = imp.getNamedImports().map(ni => ni.getName());
+			const defaultImport = imp.getDefaultImport()?.getText();
+			
+			const classification = classifyImport(moduleSpecifier, namedImports, defaultImport);
+			
+			if (classification.needsReplacement) {
+				imports.needsReplacement.push({
+					import: imp.getText(),
+					package: moduleSpecifier,
+					line: imp.getStartLineNumber(),
+					reason: classification.reason,
+					suggestedReplacement: classification.replacement,
+					migrationGuide: classification.guide,
+				});
+			} else if (classification.reactNativeReady) {
+				imports.reactNativeReady.push({
+					import: imp.getText(),
+					package: moduleSpecifier,
+					line: imp.getStartLineNumber(),
+				});
+			} else {
+				imports.needsReview.push({
+					import: imp.getText(),
+					package: moduleSpecifier,
+					line: imp.getStartLineNumber(),
+					note: 'Package compatibility unknown - manual review required',
+				});
+			}
+		}
+
+		const result = {
+			filePath,
+			summary: {
+				total: importDeclarations.length,
+				needsReplacement: imports.needsReplacement.length,
+				reactNativeReady: imports.reactNativeReady.length,
+				needsReview: imports.needsReview.length,
+			},
+			imports,
+		};
+
+		console.log(JSON.stringify(result, null, 2));
+	} catch (error) {
+		console.error(JSON.stringify({ 
+			error: error.message,
+			stack: error.stack 
+		}));
+		process.exit(1);
+	}
+}
+
+function classifyImport(pkg, namedImports, defaultImport) {
+	// React Native compatible packages
+	const rnCompatible = ['react', 'react-native', '@react-navigation', 'expo-', '@expo'];
+	if (rnCompatible.some(p => pkg.startsWith(p))) {
+		return { reactNativeReady: true };
+	}
+
+	// Routing/Navigation
+	if (pkg === 'react-router-dom' || pkg === 'react-router') {
+		return {
+			needsReplacement: true,
+			reason: 'Web routing not compatible with React Native',
+			replacement: '@react-navigation/native and related packages',
+			guide: 'browser-apis-migration.md (Navigation section)',
+		};
+	}
+
+	// State management (compatible)
+	if (['redux', 'react-redux', '@reduxjs/toolkit', 'zustand', 'jotai', 'recoil'].includes(pkg)) {
+		return { reactNativeReady: true };
+	}
+
+	// Styling libraries
+	if (['styled-components', 'emotion', '@emotion/react', '@emotion/styled'].includes(pkg)) {
+		return { reactNativeReady: true }; // These work with RN
+	}
+
+	if (pkg.includes('css-loader') || pkg.includes('style-loader')) {
+		return {
+			needsReplacement: true,
+			reason: 'Webpack loaders not used in React Native',
+			replacement: 'StyleSheet.create() from react-native',
+			guide: 'react-native-style-migration.md',
+		};
+	}
+
+	// UI libraries
+	if (['@mui/material', '@material-ui/core', 'antd', 'bootstrap'].includes(pkg)) {
+		return {
+			needsReplacement: true,
+			reason: 'Web-only UI library',
+			replacement: 'React Native UI libraries (React Native Paper, React Native Elements, NativeBase)',
+			guide: 'components-migration.md',
+		};
+	}
+
+	// Forms
+	if (pkg === 'react-hook-form') {
+		return { reactNativeReady: true }; // Works with RN
+	}
+
+	if (pkg === 'formik') {
+		return { reactNativeReady: true }; // Works with RN
+	}
+
+	// Animation
+	if (pkg === 'framer-motion') {
+		return {
+			needsReplacement: true,
+			reason: 'Web animation library',
+			replacement: 'react-native-reanimated or Animated API from react-native',
+			guide: 'animations-migration.md',
+		};
+	}
+
+	// HTTP clients (compatible)
+	if (['axios', 'ky', 'got'].includes(pkg)) {
+		return { reactNativeReady: true };
+	}
+
+	// Date libraries (compatible)
+	if (['date-fns', 'dayjs', 'luxon'].includes(pkg)) {
+		return { reactNativeReady: true };
+	}
+
+	// Testing
+	if (pkg === '@testing-library/react') {
+		return {
+			needsReplacement: true,
+			reason: 'Web testing library',
+			replacement: '@testing-library/react-native',
+			guide: 'testing-migration.md',
+		};
+	}
+
+	// Default: needs review
+	return { needsReview: true };
+}

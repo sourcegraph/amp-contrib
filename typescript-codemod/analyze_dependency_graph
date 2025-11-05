@@ -1,0 +1,454 @@
+#!/usr/bin/env node
+/**
+ * Toolbox Tool: analyze_dependency_graph
+ * 
+ * Analyzes TypeScript/JavaScript dependency graph and detects circular dependencies (SCCs).
+ * Uses Tarjan's algorithm to find strongly connected components.
+ */
+
+const action = process.env.TOOLBOX_ACTION;
+
+if (action === 'describe') {
+	showDescription();
+} else if (action === 'execute') {
+	execute();
+}
+
+function showDescription() {
+	const spec = {
+		name: 'analyze_dependency_graph',
+		description: 'Analyze dependency graph of TypeScript/JavaScript files, detect circular dependencies using Tarjan\'s algorithm, and generate optimal migration order. Returns SCCs (cycles), dependency depth, and topologically sorted migration order.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				rootPath: {
+					type: 'string',
+					description: 'Root directory path to analyze (will scan all .ts, .tsx, .js, .jsx files)',
+				},
+				filePatterns: {
+					type: 'array',
+					items: { type: 'string' },
+					description: 'Optional glob patterns to filter files (e.g., ["src/**/*.tsx", "!**/*.test.tsx"])',
+				},
+			},
+			required: ['rootPath'],
+		},
+		meta: {
+			subagentTypes: ['scope'],
+		},
+	};
+	process.stdout.write(JSON.stringify(spec));
+}
+
+async function execute() {
+	try {
+		const { Project, SyntaxKind } = await import('ts-morph');
+		const fs = await import('fs');
+		const path = await import('path');
+		const { glob } = await import('glob');
+		
+		const input = JSON.parse(fs.readFileSync(0, 'utf-8'));
+		const rootPath = input.rootPath;
+		
+		if (!fs.existsSync(rootPath)) {
+			console.error(JSON.stringify({ error: `Directory not found: ${rootPath}` }));
+			process.exit(1);
+		}
+
+		// Find all TypeScript/JavaScript files
+		const defaultPatterns = [
+			'**/*.ts',
+			'**/*.tsx',
+			'**/*.js',
+			'**/*.jsx',
+			'!**/node_modules/**',
+			'!**/dist/**',
+			'!**/build/**',
+			'!**/*.test.*',
+			'!**/*.spec.*'
+		];
+		
+		const patterns = input.filePatterns || defaultPatterns;
+		const files = await glob(patterns, { cwd: rootPath, absolute: true });
+		
+		if (files.length === 0) {
+			console.error(JSON.stringify({ error: 'No files found matching patterns' }));
+			process.exit(1);
+		}
+
+		// Build dependency graph using ts-morph
+		const graph = new Map();
+		const project = new Project({
+			useInMemoryFileSystem: true,
+			compilerOptions: {
+				jsx: 'react',
+				allowJs: true,
+			},
+		});
+
+		// First pass: Create all nodes
+		for (const filePath of files) {
+			const content = fs.readFileSync(filePath, 'utf-8');
+			const sourceFile = project.createSourceFile(filePath, content, { overwrite: true });
+			
+			graph.set(filePath, {
+				file: filePath,
+				imports: [],
+				importedBy: [],
+				exportedItems: getExportedItems(sourceFile),
+			});
+		}
+
+		// Second pass: Build edges
+		for (const filePath of files) {
+			const sourceFile = project.getSourceFile(filePath);
+			if (!sourceFile) continue;
+			
+			const imports = sourceFile.getImportDeclarations();
+			const node = graph.get(filePath);
+			
+			for (const imp of imports) {
+				const moduleSpecifier = imp.getModuleSpecifierValue();
+				
+				// Resolve relative imports
+				if (moduleSpecifier.startsWith('.')) {
+					const resolvedPath = resolveImport(filePath, moduleSpecifier, files);
+					if (resolvedPath && graph.has(resolvedPath)) {
+						node.imports.push(resolvedPath);
+						graph.get(resolvedPath).importedBy.push(filePath);
+					}
+				}
+			}
+		}
+
+		// Find Strongly Connected Components (Tarjan's Algorithm)
+		const sccs = findStronglyConnectedComponents(graph);
+		
+		// Classify cycles
+		const cycles = sccs
+			.filter(scc => scc.length > 1)
+			.map(scc => classifyCycle(scc, graph, project));
+
+		// Build condensation graph (SCCs as super-nodes)
+		const migrationOrder = buildMigrationOrder(graph, sccs);
+		
+		// Calculate statistics
+		const stats = {
+			totalFiles: files.length,
+			filesWithImports: Array.from(graph.values()).filter(n => n.imports.length > 0).length,
+			filesWithDependents: Array.from(graph.values()).filter(n => n.importedBy.length > 0).length,
+			totalCycles: cycles.length,
+			filesInCycles: new Set(cycles.flatMap(c => c.files)).size,
+		};
+
+		// Identify leaf nodes (good starting points)
+		const leaves = Array.from(graph.entries())
+			.filter(([_, node]) => node.importedBy.length === 0)
+			.map(([file, _]) => file);
+
+		// Identify core nodes (many dependents)
+		const cores = Array.from(graph.entries())
+			.filter(([_, node]) => node.importedBy.length >= 3)
+			.sort((a, b) => b[1].importedBy.length - a[1].importedBy.length)
+			.slice(0, 10)
+			.map(([file, node]) => ({
+				file,
+				dependentCount: node.importedBy.length,
+			}));
+
+		const result = {
+			rootPath,
+			stats,
+			cycles: {
+				total: cycles.length,
+				autoFixable: cycles.filter(c => c.autoFixable).length,
+				needsGuidance: cycles.filter(c => !c.autoFixable && !c.treatAsGroup).length,
+				treatAsGroups: cycles.filter(c => c.treatAsGroup).length,
+				details: cycles,
+			},
+			migrationOrder,
+			leaves,
+			cores,
+		};
+
+		console.log(JSON.stringify(result, null, 2));
+	} catch (error) {
+		console.error(JSON.stringify({ 
+			error: error.message,
+			stack: error.stack 
+		}));
+		process.exit(1);
+	}
+}
+
+function getExportedItems(sourceFile) {
+	const exports = [];
+	
+	// Named exports
+	const exportDeclarations = sourceFile.getExportDeclarations();
+	for (const exp of exportDeclarations) {
+		const namedExports = exp.getNamedExports();
+		exports.push(...namedExports.map(ne => ne.getName()));
+	}
+	
+	// Export assignments
+	const statements = sourceFile.getStatements();
+	for (const stmt of statements) {
+		if (stmt.isKind(17 /* ExportAssignment */)) {
+			exports.push('default');
+		}
+	}
+	
+	return exports;
+}
+
+function resolveImport(fromFile, importPath, allFiles) {
+	const path = require('path');
+	const fs = require('fs');
+	
+	const dir = path.dirname(fromFile);
+	let resolved = path.resolve(dir, importPath);
+	
+	// Try extensions
+	const extensions = ['.ts', '.tsx', '.js', '.jsx', ''];
+	for (const ext of extensions) {
+		const withExt = resolved + ext;
+		if (allFiles.includes(withExt)) {
+			return withExt;
+		}
+		
+		// Try index file
+		const indexPath = path.join(resolved, 'index' + ext);
+		if (allFiles.includes(indexPath)) {
+			return indexPath;
+		}
+	}
+	
+	return null;
+}
+
+// Tarjan's Algorithm for finding SCCs
+function findStronglyConnectedComponents(graph) {
+	const sccs = [];
+	const stack = [];
+	const indices = new Map();
+	const lowLinks = new Map();
+	const onStack = new Set();
+	let index = 0;
+	
+	function strongConnect(file) {
+		indices.set(file, index);
+		lowLinks.set(file, index);
+		index++;
+		stack.push(file);
+		onStack.add(file);
+		
+		const node = graph.get(file);
+		for (const importedFile of node.imports) {
+			if (!indices.has(importedFile)) {
+				strongConnect(importedFile);
+				lowLinks.set(file, Math.min(lowLinks.get(file), lowLinks.get(importedFile)));
+			} else if (onStack.has(importedFile)) {
+				lowLinks.set(file, Math.min(lowLinks.get(file), indices.get(importedFile)));
+			}
+		}
+		
+		if (lowLinks.get(file) === indices.get(file)) {
+			const scc = [];
+			let w;
+			do {
+				w = stack.pop();
+				onStack.delete(w);
+				scc.push(w);
+			} while (w !== file);
+			sccs.push(scc);
+		}
+	}
+	
+	for (const file of graph.keys()) {
+		if (!indices.has(file)) {
+			strongConnect(file);
+		}
+	}
+	
+	return sccs;
+}
+
+function classifyCycle(scc, graph, project) {
+	const path = require('path');
+	
+	// Analyze imports between files in cycle
+	let hasTypeOnlyImports = false;
+	let hasValueImports = false;
+	const importDetails = [];
+	
+	for (const file of scc) {
+		const sourceFile = project.getSourceFile(file);
+		if (!sourceFile) continue;
+		
+		const imports = sourceFile.getImportDeclarations();
+		for (const imp of imports) {
+			const moduleSpecifier = imp.getModuleSpecifierValue();
+			if (!moduleSpecifier.startsWith('.')) continue;
+			
+			const resolvedPath = resolveImport(file, moduleSpecifier, Array.from(graph.keys()));
+			if (!scc.includes(resolvedPath)) continue;
+			
+			const isTypeOnly = imp.isTypeOnly();
+			const namedImports = imp.getNamedImports().map(ni => ni.getName());
+			
+			importDetails.push({
+				from: path.basename(file),
+				to: path.basename(resolvedPath),
+				items: namedImports,
+				isTypeOnly,
+			});
+			
+			if (isTypeOnly) {
+				hasTypeOnlyImports = true;
+			} else {
+				hasValueImports = true;
+			}
+		}
+	}
+	
+	// Determine cycle type
+	let cycleType;
+	if (hasTypeOnlyImports && !hasValueImports) {
+		cycleType = 'type-only';
+	} else if (hasValueImports && !hasTypeOnlyImports) {
+		cycleType = 'value';
+	} else {
+		cycleType = 'mixed';
+	}
+	
+	// Determine strategy
+	let strategy, autoFixable, treatAsGroup;
+	
+	if (cycleType === 'type-only') {
+		strategy = 'extract-types';
+		autoFixable = true;
+		treatAsGroup = false;
+	} else if (scc.length === 2 && cycleType === 'mixed') {
+		strategy = 'extract-types-then-handle-values';
+		autoFixable = false;
+		treatAsGroup = false;
+	} else if (scc.length <= 3) {
+		strategy = 'consider-merge-or-inversion';
+		autoFixable = false;
+		treatAsGroup = false;
+	} else {
+		strategy = 'migrate-as-group';
+		autoFixable = false;
+		treatAsGroup = true;
+	}
+	
+	// Build cycle path
+	const cyclePath = scc.map(f => path.basename(f)).join(' → ') + ' → ' + path.basename(scc[0]);
+	
+	return {
+		files: scc.map(f => path.basename(f)),
+		fullPaths: scc,
+		size: scc.length,
+		cycleType,
+		cyclePath,
+		strategy,
+		autoFixable,
+		treatAsGroup,
+		importDetails,
+		resolutionSteps: getResolutionSteps(strategy, scc),
+	};
+}
+
+function getResolutionSteps(strategy, scc) {
+	const steps = {
+		'extract-types': [
+			'Create shared types file (e.g., types.ts)',
+			'Move all type definitions to shared file',
+			'Update imports to reference shared file',
+			'Verify cycle is broken',
+		],
+		'extract-types-then-handle-values': [
+			'First: Extract shared types to types.ts',
+			'Update type imports',
+			'Analyze remaining value imports',
+			'Consider dependency inversion or lazy loading',
+		],
+		'consider-merge-or-inversion': [
+			'Option 1: Merge files if tightly coupled and small',
+			'Option 2: Use dependency inversion (create interface)',
+			'Option 3: Use lazy/dynamic imports for one direction',
+			'Choose based on component size and coupling',
+		],
+		'migrate-as-group': [
+			`Migrate all ${scc.length} files together in single batch`,
+			'Treat as atomic unit',
+			'Higher risk - ensure thorough testing',
+		],
+	};
+	
+	return steps[strategy] || [];
+}
+
+function buildMigrationOrder(graph, sccs) {
+	// Build condensation graph (SCCs as super-nodes)
+	const fileToSCC = new Map();
+	const sccNodes = [];
+	
+	sccs.forEach((scc, index) => {
+		sccNodes.push({
+			id: index,
+			files: scc,
+			dependencies: new Set(),
+		});
+		scc.forEach(file => fileToSCC.set(file, index));
+	});
+	
+	// Build edges between SCCs
+	for (const [file, node] of graph) {
+		const sourceSCC = fileToSCC.get(file);
+		
+		for (const imported of node.imports) {
+			const targetSCC = fileToSCC.get(imported);
+			
+			if (sourceSCC !== targetSCC && targetSCC !== undefined) {
+				sccNodes[sourceSCC].dependencies.add(targetSCC);
+			}
+		}
+	}
+	
+	// Topological sort of SCCs
+	const visited = new Set();
+	const sorted = [];
+	
+	function visit(sccIndex) {
+		if (visited.has(sccIndex)) return;
+		visited.add(sccIndex);
+		
+		const scc = sccNodes[sccIndex];
+		for (const dep of scc.dependencies) {
+			visit(dep);
+		}
+		
+		sorted.push(scc);
+	}
+	
+	for (let i = 0; i < sccNodes.length; i++) {
+		if (!visited.has(i)) {
+			visit(i);
+		}
+	}
+	
+	// Build final migration order
+	const path = require('path');
+	return sorted.map(scc => {
+		if (scc.files.length === 1) {
+			return path.basename(scc.files[0]);
+		} else {
+			return {
+				group: scc.files.map(f => path.basename(f)),
+				reason: 'circular-dependency',
+			};
+		}
+	});
+}

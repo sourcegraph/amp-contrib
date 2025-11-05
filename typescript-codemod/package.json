@@ -1,0 +1,13 @@
+{
+  "name": "tools",
+  "version": "1.0.0",
+  "description": "This directory contains ts-morph-based toolbox tools for detecting React Native migration patterns with high accuracy through AST parsing.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

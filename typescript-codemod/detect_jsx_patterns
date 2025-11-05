@@ -1,0 +1,188 @@
+#!/usr/bin/env node
+/**
+ * Toolbox Tool: detect-jsx-patterns
+ * 
+ * Detects HTML-like JSX elements that need transformation to React Native components.
+ * Uses ts-morph for AST parsing to provide deterministic pattern detection.
+ */
+
+const action = process.env.TOOLBOX_ACTION;
+
+if (action === 'describe') {
+	showDescription();
+} else if (action === 'execute') {
+	execute();
+}
+
+function showDescription() {
+	const spec = {
+		name: 'detect_jsx_patterns',
+		description: 'Detect HTML-like JSX elements (div, span, img, etc.) in a TypeScript/JavaScript file that need transformation to React Native components. Returns structured information about each element found.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				filePath: {
+					type: 'string',
+					description: 'Absolute path to the TypeScript/JavaScript/JSX/TSX file to analyze',
+				},
+			},
+			required: ['filePath'],
+		},
+		meta: {
+			subagentTypes: ['executor'],
+		},
+	};
+	process.stdout.write(JSON.stringify(spec));
+}
+
+async function execute() {
+	try {
+		const { Project, SyntaxKind } = await import('ts-morph');
+		const fs = await import('fs');
+		const path = await import('path');
+		
+		const input = JSON.parse(fs.readFileSync(0, 'utf-8'));
+		const filePath = input.filePath;
+
+		if (!fs.existsSync(filePath)) {
+			console.error(JSON.stringify({ error: `File not found: ${filePath}` }));
+			process.exit(1);
+		}
+
+		// Read file content
+		const fileContent = fs.readFileSync(filePath, 'utf-8');
+		
+		const project = new Project({
+			useInMemoryFileSystem: true,
+			compilerOptions: {
+				jsx: 'react',
+				allowJs: true,
+			},
+		});
+
+		const sourceFile = project.createSourceFile('temp.tsx', fileContent);
+		
+		// HTML elements that need transformation
+		const htmlElements = [
+			'div', 'span', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+			'button', 'input', 'textarea', 'select', 'label',
+			'img', 'video', 'audio', 'canvas',
+			'ul', 'ol', 'li',
+			'a', 'form',
+			'section', 'article', 'header', 'footer', 'nav', 'main', 'aside',
+		];
+
+		const jsxElements = sourceFile.getDescendantsOfKind(SyntaxKind.JsxOpeningElement);
+		const jsxSelfClosing = sourceFile.getDescendantsOfKind(SyntaxKind.JsxSelfClosingElement);
+		
+		const allElements = [...jsxElements, ...jsxSelfClosing];
+		
+		const patterns = [];
+		const elementCounts = {};
+
+		for (const element of allElements) {
+			const tagName = element.getTagNameNode().getText();
+			
+			if (htmlElements.includes(tagName)) {
+				const line = element.getStartLineNumber();
+				const attributes = element.getAttributes().map(attr => {
+					if (attr.getKind() === SyntaxKind.JsxAttribute) {
+						const nameNode = attr.getNameNode?.();
+						return {
+							name: nameNode ? nameNode.getText() : 'unknown',
+							value: attr.getInitializer?.()?.getText() || 'true',
+						};
+					}
+					return null;
+				}).filter(Boolean);
+
+				patterns.push({
+					element: tagName,
+					line,
+					column: element.getStartLinePos(),
+					attributes,
+					suggestedReplacement: getSuggestedReplacement(tagName),
+				});
+
+				elementCounts[tagName] = (elementCounts[tagName] || 0) + 1;
+			}
+		}
+
+		const result = {
+			filePath,
+			totalHtmlElements: patterns.length,
+			elementCounts,
+			patterns,
+			migrationGuides: getMigrationGuides(elementCounts),
+		};
+
+		console.log(JSON.stringify(result, null, 2));
+	} catch (error) {
+		console.error(JSON.stringify({ 
+			error: error.message,
+			stack: error.stack 
+		}));
+		process.exit(1);
+	}
+}
+
+function getSuggestedReplacement(htmlTag) {
+	const mappings = {
+		'div': 'View',
+		'span': 'Text',
+		'p': 'Text',
+		'h1': 'Text',
+		'h2': 'Text',
+		'h3': 'Text',
+		'h4': 'Text',
+		'h5': 'Text',
+		'h6': 'Text',
+		'button': 'Pressable',
+		'input': 'TextInput',
+		'textarea': 'TextInput (multiline)',
+		'select': 'Picker (from @react-native-picker/picker)',
+		'img': 'Image',
+		'video': 'Video (from expo-av or react-native-video)',
+		'audio': 'Audio (from expo-av)',
+		'canvas': 'Canvas (from react-native-canvas or react-native-skia)',
+		'ul': 'FlatList or View',
+		'ol': 'FlatList or View',
+		'li': 'View or Text',
+		'a': 'Text with onPress + Linking',
+		'form': 'View',
+		'section': 'View',
+		'article': 'View',
+		'header': 'View',
+		'footer': 'View',
+		'nav': 'View',
+		'main': 'View',
+		'aside': 'View',
+	};
+	return mappings[htmlTag] || 'View';
+}
+
+function getMigrationGuides(elementCounts) {
+	const guides = new Set();
+	
+	// All JSX transformations need components guide
+	if (Object.keys(elementCounts).length > 0) {
+		guides.add('components-migration.md');
+	}
+	
+	// Form elements need special attention
+	if (elementCounts.input || elementCounts.textarea || elementCounts.select || elementCounts.form) {
+		guides.add('components-migration.md (Form elements section)');
+	}
+	
+	// Media elements
+	if (elementCounts.img || elementCounts.video || elementCounts.audio) {
+		guides.add('assets-migration.md');
+	}
+	
+	// Lists
+	if (elementCounts.ul || elementCounts.ol || elementCounts.li) {
+		guides.add('components-migration.md (List virtualization section)');
+	}
+	
+	return Array.from(guides);
+}

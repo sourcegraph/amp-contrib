@@ -1,0 +1,216 @@
+#!/usr/bin/env node
+/**
+ * Toolbox Tool: detect-browser-apis
+ * 
+ * Detects browser API usage (localStorage, window, document, etc.) that needs
+ * transformation to React Native equivalents.
+ */
+
+const action = process.env.TOOLBOX_ACTION;
+
+if (action === 'describe') {
+	showDescription();
+} else if (action === 'execute') {
+	execute();
+}
+
+function showDescription() {
+	const spec = {
+		name: 'detect_browser_apis',
+		description: 'Detect browser API usage (localStorage, sessionStorage, window, document, navigator, etc.) in a file that need transformation to React Native APIs. Returns specific API calls with their locations.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				filePath: {
+					type: 'string',
+					description: 'Absolute path to the TypeScript/JavaScript file to analyze',
+				},
+			},
+			required: ['filePath'],
+		},
+		meta: {
+			subagentTypes: ['scope'],
+		},
+	};
+	process.stdout.write(JSON.stringify(spec));
+}
+
+async function execute() {
+	try {
+		const { Project, SyntaxKind } = await import('ts-morph');
+		const fs = await import('fs');
+		
+		const input = JSON.parse(fs.readFileSync(0, 'utf-8'));
+		const filePath = input.filePath;
+
+		if (!fs.existsSync(filePath)) {
+			console.error(JSON.stringify({ error: `File not found: ${filePath}` }));
+			process.exit(1);
+		}
+
+		const fileContent = fs.readFileSync(filePath, 'utf-8');
+		
+		const project = new Project({
+			useInMemoryFileSystem: true,
+			compilerOptions: {
+				allowJs: true,
+			},
+		});
+
+		const sourceFile = project.createSourceFile('temp.ts', fileContent);
+		
+		const patterns = {
+			storage: [],
+			window: [],
+			document: [],
+			navigator: [],
+			location: [],
+		};
+
+		// Find all identifier and property access expressions
+		const identifiers = sourceFile.getDescendantsOfKind(SyntaxKind.Identifier);
+		const propertyAccess = sourceFile.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression);
+
+		// Storage APIs
+		for (const id of identifiers) {
+			const text = id.getText();
+			if (text === 'localStorage' || text === 'sessionStorage') {
+				const parent = id.getParent();
+				patterns.storage.push({
+					api: text,
+					usage: parent?.getText() || text,
+					line: id.getStartLineNumber(),
+					suggestedReplacement: text === 'localStorage' 
+						? 'AsyncStorage (from @react-native-async-storage/async-storage) for non-sensitive data, or SecureStore (from expo-secure-store) for sensitive data'
+						: 'In-memory state management (useState, Redux, Zustand) - sessionStorage has no React Native equivalent',
+				});
+			}
+		}
+
+		// Window APIs
+		for (const expr of propertyAccess) {
+			const exprText = expr.getText();
+			
+			// Window properties
+			if (exprText.startsWith('window.')) {
+				const property = exprText.split('.')[1];
+				let replacement = '';
+				
+				if (property === 'innerWidth' || property === 'innerHeight') {
+					replacement = `Dimensions.get('window').${property === 'innerWidth' ? 'width' : 'height'}`;
+				} else if (property === 'location') {
+					replacement = 'Linking API';
+				} else if (property === 'open') {
+					replacement = 'Linking.openURL()';
+				} else if (property === 'addEventListener') {
+					replacement = 'Component-level event handlers or specific React Native APIs';
+				} else {
+					replacement = 'Check React Native documentation - window object not available';
+				}
+				
+				patterns.window.push({
+					api: exprText,
+					line: expr.getStartLineNumber(),
+					suggestedReplacement: replacement,
+				});
+			}
+			
+			// Document APIs
+			if (exprText.startsWith('document.')) {
+				const property = exprText.split('.')[1];
+				let replacement = '';
+				
+				if (property === 'getElementById' || property === 'querySelector') {
+					replacement = 'Use refs (useRef hook) instead';
+				} else if (property === 'addEventListener') {
+					replacement = 'Component-level event handlers';
+				} else if (property === 'cookie') {
+					replacement = 'AsyncStorage or SecureStore - no cookie support';
+				} else {
+					replacement = 'No DOM - use React Native components and refs';
+				}
+				
+				patterns.document.push({
+					api: exprText,
+					line: expr.getStartLineNumber(),
+					suggestedReplacement: replacement,
+				});
+			}
+			
+			// Navigator APIs
+			if (exprText.startsWith('navigator.')) {
+				const property = exprText.split('.')[1];
+				let replacement = '';
+				
+				if (property === 'geolocation') {
+					replacement = 'expo-location or @react-native-community/geolocation';
+				} else if (property === 'mediaDevices') {
+					replacement = 'expo-camera or react-native-camera';
+				} else if (property === 'clipboard') {
+					replacement = '@react-native-clipboard/clipboard';
+				} else {
+					replacement = 'Check React Native documentation for equivalent';
+				}
+				
+				patterns.navigator.push({
+					api: exprText,
+					line: expr.getStartLineNumber(),
+					suggestedReplacement: replacement,
+				});
+			}
+
+			// Location APIs
+			if (exprText.includes('.location.')) {
+				patterns.location.push({
+					api: exprText,
+					line: expr.getStartLineNumber(),
+					suggestedReplacement: 'Linking API or React Navigation for routing',
+				});
+			}
+		}
+
+		const totalIssues = 
+			patterns.storage.length +
+			patterns.window.length +
+			patterns.document.length +
+			patterns.navigator.length +
+			patterns.location.length;
+
+		const result = {
+			filePath,
+			totalBrowserAPIs: totalIssues,
+			patterns,
+			migrationGuides: getMigrationGuides(patterns),
+		};
+
+		console.log(JSON.stringify(result, null, 2));
+	} catch (error) {
+		console.error(JSON.stringify({ 
+			error: error.message,
+			stack: error.stack 
+		}));
+		process.exit(1);
+	}
+}
+
+function getMigrationGuides(patterns) {
+	const guides = new Set();
+	
+	if (patterns.storage.length > 0) {
+		guides.add('browser-apis-migration.md (Storage section)');
+	}
+	
+	if (patterns.window.length > 0 || patterns.document.length > 0) {
+		guides.add('browser-apis-migration.md (Window/Document APIs section)');
+	}
+	
+	if (patterns.navigator.length > 0) {
+		guides.add('device-apis-migration.md');
+	}
+	
+	if (patterns.location.length > 0) {
+		guides.add('browser-apis-migration.md (Navigation section)');
+	}
+	
+	return Array.from(guides);
+}
