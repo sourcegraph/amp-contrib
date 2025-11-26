@@ -18,7 +18,7 @@ A lightweight sandboxing tool that enforces filesystem and network restrictions 
 
 The `amp-srt-settings.json` file provides a baseline policy that:
 
-- **Network**: Allows connections to common development domains (GitHub, npm, PyPI, crates.io, etc.) while blocking everything else
+- **Network**: Allows connections required by Amp while blocking everything else
 - **Filesystem**: Restricts write access to the working directory, config directories, and temp folders
 
 Treat this as a starting point and modify it as appropriate for your needs.
