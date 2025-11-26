@@ -1,0 +1,49 @@
+{
+  "network": {
+    "allowedDomains": [
+      "ampcode.com",
+      "*.ampcode.com",
+      "npmjs.org",
+      "*.npmjs.org",
+      "npmjs.com",
+      "*.npmjs.com",
+      "storage.googleapis.com"
+    ],
+    "deniedDomains": [],
+    "allowLocalBinding": true,
+    "allowUnixSockets": [
+      "/var/run/mDNSResponder",
+      "/private/var/run/mDNSResponder"
+    ]
+  },
+  "filesystem": {
+    "denyRead": [],
+    "allowWrite": [
+      ".",
+      "~/.amp",
+      "~/.bun",
+      "~/.cache/amp",
+      "~/.config/amp",
+      "~/.local/share/amp",
+      "~/.local/state/amp",
+      "~/.mcp-auth",
+      "~/.npm",
+      "~/go/pkg",
+      "~/Library/Caches",
+      "~/Library/Logs",
+      "~/Library/Application Support",
+      "/tmp",
+      "/var/tmp",
+      "/var/folders",
+      "/private/var/folders",
+      "/private/tmp"
+    ],
+    "denyWrite": []
+  },
+  "ignoreViolations": {
+    "*": [
+      "/usr/bin",
+      "/System"
+    ]
+  }
+}
