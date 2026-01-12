@@ -1,6 +1,6 @@
 {
 	"type": "module",
 	"dependencies": {
-		"puppeteer-core": "^24.27.0"
+		"puppeteer-core": "^24.35.0"
 	}
 }
